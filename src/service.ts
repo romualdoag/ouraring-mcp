@@ -118,13 +118,22 @@ export interface PageResult<T = unknown> {
   next_token: string | null;
 }
 
+/** Return an access token, minting one from the refresh token when none is configured. */
+async function ensureAccessToken(): Promise<string> {
+  try {
+    return getAccessToken();
+  } catch {
+    return refreshAccessToken();
+  }
+}
+
 async function ouraGet<T = unknown>(
   path: string,
   params: Record<string, string | undefined>,
   token?: string,
   _retried?: boolean,
 ): Promise<PageResult<T>> {
-  const accessToken = token ?? getAccessToken();
+  const accessToken = token ?? (await ensureAccessToken());
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== "") qs.set(k, v);
