@@ -215,8 +215,8 @@ no storage, no sharing, single user. Revoke any time from your Oura dashboard.
 ## Develop
 
 ```bash
-npm test    # build + vitest (offline unit, stdio protocol, opt-in live)
-npm run audit   # fail on moderate+ advisories (dev + prod deps)
+npm test   # build + vitest (offline unit, stdio protocol, opt-in live)
+npm audit --audit-level=moderate   # fail on moderate+ advisories (dev + prod deps)
 ```
 
 `tests/live.test.ts` calls the real API only when `OURARING_ACCESS_TOKEN` is set;
