@@ -215,7 +215,8 @@ no storage, no sharing, single user. Revoke any time from your Oura dashboard.
 ## Develop
 
 ```bash
-npm test   # build + vitest (offline unit, stdio protocol, opt-in live)
+npm test    # build + vitest (offline unit, stdio protocol, opt-in live)
+npm run audit   # fail on moderate+ advisories (dev + prod deps)
 ```
 
 `tests/live.test.ts` calls the real API only when `OURARING_ACCESS_TOKEN` is set;
@@ -223,4 +224,8 @@ otherwise it passes with a skip note.
 
 Every push is gated: `npm run setup:hooks` installs a `pre-push` hook that
 rebuilds and runs the suite — a red test blocks the push. GitHub Actions
-(`.github/workflows/ci.yml`) enforces the same on every push/PR.
+(`.github/workflows/ci.yml`) enforces the same on every push/PR, plus
+`npm audit` (moderate+) so new advisories break the build before merge.
+Dependency upgrades that fix audit findings must keep the suite green
+(e.g. vitest 3 → 5); if a fix needs a breaking major, do it in its own commit
+with the audit delta in the message.
