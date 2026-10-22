@@ -1,0 +1,31 @@
+{
+  "name": "ouraring-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets an AI assistant read your own Oura Ring data (sleep, readiness, activity, heart rate, stress, workouts)",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ouraring-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "npm run build && vitest run",
+    "setup:hooks": "bash scripts/setup-hooks.sh",
+    "auth:oura": "tsx src/auth.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
