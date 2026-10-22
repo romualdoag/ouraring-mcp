@@ -35,14 +35,7 @@ npm install
 npm run build
 ```
 
-### 1) Easiest: Personal Access Token (single user)
-
-1. Create a token at https://cloud.ouraring.com/personal-access-tokens
-2. `cp .env.example .env` and set `OURARING_ACCESS_TOKEN=<token>`
-   (already-known `OURA_ACCESS_TOKEN` also works; `OURARING_*` wins)
-3. `npm start` — stdio MCP server
-
-### 2) OAuth2 app (what the Oura application form asks for)
+### OAuth2 (only method — Oura retired PATs Dec 2025)
 
 Register at https://cloud.ouraring.com/oauth/applications with:
 
@@ -53,32 +46,30 @@ Register at https://cloud.ouraring.com/oauth/applications with:
 Then:
 
 ```bash
-cp .env.example .env   # only needed to override; OURARING_CLIENT_ID/SECRET already in ~/.hermes/.env
-npm run auth:oura       # opens authorize URL, catches the callback, prints tokens
+npm run auth:oura       # prints the authorize URL
+# open the URL, approve, copy ?code= from the localhost redirect, then:
+npm run auth:oura -- --code=PASTE_CODE_HERE
 ```
 
 `auth:oura` reads `OURARING_CLIENT_ID`/`OURARING_CLIENT_SECRET` from the
 environment → local `.env` → `~/.hermes/.env`, then prints
-`OURARING_ACCESS_TOKEN` (short-lived) + `OURARING_REFRESH_TOKEN`.
-Refresh when needed:
-
-```bash
-curl -s -u "$OURARING_CLIENT_ID:$OURARING_CLIENT_SECRET" \
-  -d grant_type=refresh_token -d refresh_token="$OURARING_REFRESH_TOKEN" \
-  https://api.ouraring.com/oauth/token
-```
+`OURARING_ACCESS_TOKEN` (short-lived) + `OURARING_REFRESH_TOKEN` (long-lived).
+The server auto-refreshes via the refresh token when client credentials are present — no manual refresh needed.
 
 ## Install in your tools
 
 Build once (`npm install && npm run build`), then point any client at
-`dist/index.js` via stdio with `OURARING_ACCESS_TOKEN` in the environment.
+`dist/index.js` via stdio with `OURARING_REFRESH_TOKEN` + `OURARING_CLIENT_ID` +
+`OURARING_CLIENT_SECRET` in the environment (server auto-refreshes; access token alone expira rápido).
 Replace `/path/to/ouraring-mcp` with your checkout below.
 
 ### Claude Code
 
 ```bash
 claude mcp add ouraring \
-  --env OURARING_ACCESS_TOKEN=... \
+  --env OURARING_REFRESH_TOKEN=... \
+  --env OURARING_CLIENT_ID=... \
+  --env OURARING_CLIENT_SECRET=... \
   -- node /path/to/ouraring-mcp/dist/index.js
 ```
 
@@ -90,7 +81,11 @@ Or per-project `.mcp.json` (user scope: `claude mcp add -s user ...`):
     "ouraring": {
       "command": "node",
       "args": ["/path/to/ouraring-mcp/dist/index.js"],
-      "env": { "OURARING_ACCESS_TOKEN": "..." }
+      "env": {
+        "OURARING_REFRESH_TOKEN": "...",
+        "OURARING_CLIENT_ID": "...",
+        "OURARING_CLIENT_SECRET": "..."
+      }
     }
   }
 }
@@ -104,14 +99,18 @@ command = "node"
 args = ["/path/to/ouraring-mcp/dist/index.js"]
 
 [mcp_servers.ouraring.env]
-OURARING_ACCESS_TOKEN = "..."
+OURARING_REFRESH_TOKEN = "..."
+OURARING_CLIENT_ID = "..."
+OURARING_CLIENT_SECRET = "..."
 ```
 
 ### OpenCode
 
 ```bash
 opencode mcp add ouraring \
-  --env OURARING_ACCESS_TOKEN=... \
+  --env OURARING_REFRESH_TOKEN=... \
+  --env OURARING_CLIENT_ID=... \
+  --env OURARING_CLIENT_SECRET=... \
   -- node /path/to/ouraring-mcp/dist/index.js
 ```
 
@@ -126,7 +125,11 @@ older versions use flat `mcp`):
       "ouraring": {
         "type": "local",
         "command": ["node", "/path/to/ouraring-mcp/dist/index.js"],
-        "environment": { "OURARING_ACCESS_TOKEN": "..." }
+        "environment": {
+          "OURARING_REFRESH_TOKEN": "...",
+          "OURARING_CLIENT_ID": "...",
+          "OURARING_CLIENT_SECRET": "..."
+        }
       }
     }
   }
@@ -142,7 +145,9 @@ mcp_servers:
     args:
       - /home/hermes/github/ouraring-mcp/dist/index.js
     env:
-      OURARING_ACCESS_TOKEN: "..."
+      OURARING_REFRESH_TOKEN: "..."
+      OURARING_CLIENT_ID: "..."
+      OURARING_CLIENT_SECRET: "..."
     enabled: true
 ```
 
@@ -157,8 +162,8 @@ openclaw mcp add ouraring \
 openclaw mcp doctor ouraring --probe
 ```
 
-Set the token via Settings → MCP (scoped config editor → environment
-values), or `OURARING_ACCESS_TOKEN` in the gateway environment.
+Set the tokens via Settings → MCP (scoped config editor → environment
+values), or `OURARING_REFRESH_TOKEN` + client credentials in the gateway environment.
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
@@ -168,7 +173,11 @@ values), or `OURARING_ACCESS_TOKEN` in the gateway environment.
     "ouraring": {
       "command": "node",
       "args": ["/path/to/ouraring-mcp/dist/index.js"],
-      "env": { "OURARING_ACCESS_TOKEN": "..." }
+      "env": {
+        "OURARING_REFRESH_TOKEN": "...",
+        "OURARING_CLIENT_ID": "...",
+        "OURARING_CLIENT_SECRET": "..."
+      }
     }
   }
 }

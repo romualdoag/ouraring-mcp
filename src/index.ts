@@ -19,7 +19,7 @@ import {
   DETAIL_COLLECTIONS,
 } from "./service.js";
 
-const server = new McpServer({ name: "ouraring-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "ouraring-mcp", version: "0.2.0" });
 
 type Ok = { content: [{ type: "text"; text: string }] };
 type Err = { content: [{ type: "text"; text: string }]; isError: true };

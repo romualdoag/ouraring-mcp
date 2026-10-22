@@ -54,15 +54,47 @@ export class OuraError extends Error {
 }
 
 export function getAccessToken(): string {
-  const token = envVar("ACCESS_TOKEN") || envVar("PAT");
+  const token = envVar("ACCESS_TOKEN");
   if (!token) {
     throw new OuraError(
-      "No Oura credentials. Set OURARING_ACCESS_TOKEN (or OURA_ACCESS_TOKEN) — Personal Access Token from " +
-        "https://cloud.ouraring.com/personal-access-tokens — or run `npm run auth:oura` " +
-        "for the OAuth2 flow with the OURARING_CLIENT_ID/OURARING_CLIENT_SECRET already in ~/.hermes/.env.",
+      "No Oura credentials. Set OURARING_ACCESS_TOKEN (OAuth2 access token — Oura retired Personal Access Tokens in Dec 2025) " +
+        "or run `npm run auth:oura` for the OAuth2 flow with the OURARING_CLIENT_ID/OURARING_CLIENT_SECRET already in ~/.hermes/.env. " +
+        "If you have OURARING_REFRESH_TOKEN, the server will refresh automatically.",
     );
   }
   return token;
+}
+
+export function getRefreshToken(): string | undefined {
+  return envVar("REFRESH_TOKEN");
+}
+
+/** Exchange OURARING_REFRESH_TOKEN (+ client credentials) for a fresh access token. */
+export async function refreshAccessToken(): Promise<string> {
+  const refreshToken = getRefreshToken();
+  const clientId = envVar("CLIENT_ID");
+  const clientSecret = envVar("CLIENT_SECRET");
+  if (!refreshToken) throw new OuraError("No OURARING_REFRESH_TOKEN configured — run `npm run auth:oura` once.");
+  if (!clientId || !clientSecret) throw new OuraError("Need OURARING_CLIENT_ID + OURARING_CLIENT_SECRET to refresh (already in ~/.hermes/.env).");
+  const res = await fetch(`${OURA_API_BASE}/oauth/token`, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
+  });
+  const body = await res.text().catch(() => "");
+  if (!res.ok) throw new OuraError(`Oura token refresh failed (HTTP ${res.status}): ${body.slice(0, 300)}`, res.status);
+  let json: { access_token?: string };
+  try {
+    json = JSON.parse(body);
+  } catch {
+    throw new OuraError("Oura token refresh returned non-JSON.", res.status);
+  }
+  if (!json.access_token) throw new OuraError("Oura token refresh returned no access_token.", res.status);
+  process.env.OURARING_ACCESS_TOKEN = json.access_token;
+  return json.access_token;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +122,7 @@ async function ouraGet<T = unknown>(
   path: string,
   params: Record<string, string | undefined>,
   token?: string,
+  _retried?: boolean,
 ): Promise<PageResult<T>> {
   const accessToken = token ?? getAccessToken();
   const qs = new URLSearchParams();
@@ -121,10 +154,19 @@ async function ouraGet<T = unknown>(
     clearTimeout(timer);
   }
   if (res.status === 401 || res.status === 403) {
+    // OAuth access tokens are short-lived — if a refresh token is configured, try once, then retry.
+    if (!_retried && !token && getRefreshToken() && envVar("CLIENT_ID") && envVar("CLIENT_SECRET")) {
+      try {
+        const fresh = await refreshAccessToken();
+        return ouraGet<T>(path, params, fresh, true);
+      } catch {
+        /* fall through to the credentials error below */
+      }
+    }
     throw new OuraError(
       "Oura rejected the credentials (HTTP " +
         res.status +
-        "). Token expired/revoked or missing scope — refresh the OAuth token or issue a new Personal Access Token.",
+        "). Token expired/revoked or missing scope — the server already tried refresh (if configured); otherwise run `npm run auth:oura` again. Oura retired PATs in Dec 2025, OAuth2 only.",
       res.status,
     );
   }
@@ -232,17 +274,22 @@ export async function ouraStatus(): Promise<Record<string, unknown>> {
   } catch {
     configured = false;
   }
+  const refreshConfigured = Boolean(getRefreshToken());
   return {
     server: "ouraring-mcp",
     version: packageVersion(),
     api_base: OURA_API_BASE,
+    auth: "oauth2-only (Oura retired PATs Dec 2025)",
     auth_configured: configured,
     token: tokenPrefix || null,
+    refresh_token_configured: refreshConfigured,
     oauth_client_configured: Boolean(envVar("CLIENT_ID") && envVar("CLIENT_SECRET")),
     redirect_uri: envVar("REDIRECT_URI") || "http://localhost:8080/callback",
     hint: configured
       ? "Credentials present. Call get_personal_info to verify them live."
-      : "Set OURARING_ACCESS_TOKEN (see .env.example) or run `npm run auth:oura` (uses OURARING_CLIENT_ID/SECRET from ~/.hermes/.env).",
+      : refreshConfigured
+        ? "Refresh token present but no access token — next live call will mint one automatically."
+        : "No access token. Run `npm run auth:oura -- --code=...` (OAuth2, uses OURARING_CLIENT_ID/SECRET from ~/.hermes/.env).",
   };
 }
 
