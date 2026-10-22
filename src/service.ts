@@ -175,7 +175,7 @@ async function ouraGet<T = unknown>(
     throw new OuraError(
       "Oura rejected the credentials (HTTP " +
         res.status +
-        "). Token expired/revoked or missing scope — the server already tried refresh (if configured); otherwise run `npm run auth:oura` again. Oura retired PATs in Dec 2025, OAuth2 only.",
+        "). Token expired/revoked, missing scope, or (on 403) expired Oura subscription — the server already tried refresh (if configured); otherwise run `npm run auth:oura` again. Oura retired PATs in Dec 2025, OAuth2 only.",
       res.status,
     );
   }
@@ -242,17 +242,61 @@ const COLLECTION_SCOPE: Record<string, string> = {
   vo2_max: "daily",
 };
 
+/** Exact API path segment per collection (lowercase key → spec-exact case).
+ *  NOTE: vO2_max is case-sensitive upstream — lowercase vo2_max 404s. */
+const COLLECTION_PATH: Record<string, string> = {
+  personal_info: "personal_info",
+  daily_activity: "daily_activity",
+  daily_cardiovascular_age: "daily_cardiovascular_age",
+  daily_readiness: "daily_readiness",
+  daily_resilience: "daily_resilience",
+  daily_sleep: "daily_sleep",
+  daily_spo2: "daily_spo2",
+  daily_stress: "daily_stress",
+  sleep: "sleep",
+  sleep_time: "sleep_time",
+  workout: "workout",
+  session: "session",
+  tag: "tag",
+  enhanced_tag: "enhanced_tag",
+  heartrate: "heartrate",
+  rest_mode_period: "rest_mode_period",
+  ring_configuration: "ring_configuration",
+  ring_battery_level: "ring_battery_level",
+  vo2_max: "vO2_max",
+};
+
+/** Exact /v2/usercollection/<path> for a (case-insensitive) collection name. */
+export function collectionPath(collection: string): string {
+  const seg = COLLECTION_PATH[collection.toLowerCase()];
+  if (!seg) throw new OuraError(`Unknown collection "${collection}". See list_collections.`);
+  return `/v2/usercollection/${seg}`;
+}
+
+/** Collections queried by datetime (start_datetime/end_datetime/latest), not dates. */
+const DATETIME_COLLECTIONS = new Set(["heartrate", "ring_battery_level"]);
+/** Collections that accept no date/datetime params (params other than fields/next_token are ignored upstream). */
+const NODATE_COLLECTIONS = new Set(["personal_info", "ring_configuration"]);
+/** Collections with a GET /{document_id} variant. Others 404 on single-doc fetch. */
+const DOC_VARIANTS = new Set([
+  "daily_activity", "daily_cardiovascular_age", "daily_readiness", "daily_resilience",
+  "daily_sleep", "daily_spo2", "daily_stress",
+  "rest_mode_period", "ring_configuration", "session", "sleep", "sleep_time",
+  "tag", "vo2_max", "workout",
+]);
+/** Collections whose route does not support the `fields` selector (all fields always returned). */
+const NO_FIELDS = new Set(["daily_resilience", "enhanced_tag", "tag"]);
+
 export function listCollections(): { collection: string; path: string; scope: string }[] {
-  const daily = DAILY_TYPES.map((t) => ({
-    collection: `daily_${t}`,
-    path: `/v2/usercollection/daily_${t}`,
-    scope: COLLECTION_SCOPE[`daily_${t}`] || "",
-  }));
+  const daily = DAILY_TYPES.map((t) => {
+    const collection = `daily_${t}`;
+    return { collection, path: collectionPath(collection), scope: COLLECTION_SCOPE[collection] || "" };
+  });
   const detail: { collection: string; path: string; scope: string }[] = [
-    { collection: "personal_info", path: "/v2/usercollection/personal_info", scope: COLLECTION_SCOPE.personal_info },
+    { collection: "personal_info", path: collectionPath("personal_info"), scope: COLLECTION_SCOPE.personal_info },
     ...DETAIL_COLLECTIONS.map((c) => ({
       collection: c,
-      path: `/v2/usercollection/${c}`,
+      path: collectionPath(c),
       scope: COLLECTION_SCOPE[c] || "",
     })),
   ];
@@ -313,6 +357,14 @@ export interface DateRangeOpts {
   end_date?: string;
   limit?: number;
   next_token?: string;
+  /** Comma-separated field selector (supported by most routes; not by daily_resilience/enhanced_tag/tag). */
+  fields?: string;
+}
+
+function assertFields(collection: string, fields: string | undefined): void {
+  if (fields !== undefined && NO_FIELDS.has(collection)) {
+    throw new OuraError(`Collection "${collection}" does not support field selection — all fields are always returned.`);
+  }
 }
 
 function assertDateRange(opts: DateRangeOpts): void {
@@ -356,10 +408,12 @@ export async function getDaily(
     throw new OuraError(`Unknown daily type "${dataType}" — one of: ${DAILY_TYPES.join(", ")}.`);
   }
   assertDateRange(opts);
+  assertFields(`daily_${t}`, opts.fields);
   const rows = await fetchAllPages(`/v2/usercollection/daily_${t}`, {
     start_date: opts.start_date,
     end_date: opts.end_date,
     next_token: opts.next_token,
+    fields: opts.fields,
   }, opts.limit, token);
   const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
   return {
@@ -392,28 +446,40 @@ export async function getCollection(
   }
   if (c === "personal_info") return { collection: c, result: await getPersonalInfo(token) };
   assertDateRange(opts);
+  assertFields(c, opts.fields);
   if (opts.limit !== undefined && (!Number.isInteger(opts.limit) || opts.limit <= 0)) {
     throw new OuraError(`Invalid limit "${opts.limit}" — must be a positive integer.`);
   }
-  // single-document fetch
+  // single-document fetch (only collections with a GET /{document_id} variant)
   if (opts.document_id) {
-    const page = await ouraGet(`/v2/usercollection/${c}/${opts.document_id}`, {}, token);
+    if (!DOC_VARIANTS.has(c)) {
+      throw new OuraError(`Collection "${collection}" has no single-document endpoint — query it by date range instead.`);
+    }
+    const page = await ouraGet(`${collectionPath(c)}/${opts.document_id}`, {}, token);
     return { collection: c, document_id: opts.document_id, result: (page as unknown as { data?: unknown }).data ?? page };
   }
-  const params: Record<string, string | undefined> = c === "heartrate"
+  const params: Record<string, string | undefined> = DATETIME_COLLECTIONS.has(c)
     ? {
       start_datetime: opts.start_datetime,
       end_datetime: opts.end_datetime,
       latest: opts.latest ? "true" : undefined,
       next_token: opts.next_token,
+      fields: opts.fields,
     }
-    : { start_date: opts.start_date, end_date: opts.end_date, next_token: opts.next_token };
-  const rows = await fetchAllPages(`/v2/usercollection/${c}`, params, opts.limit, token);
+    : NODATE_COLLECTIONS.has(c)
+      ? { next_token: opts.next_token, fields: opts.fields }
+      : {
+        start_date: opts.start_date,
+        end_date: opts.end_date,
+        next_token: opts.next_token,
+        fields: opts.fields,
+      };
+  const rows = await fetchAllPages(collectionPath(c), params, opts.limit, token);
   const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
   return { collection: c, total, truncated, items };
 }
 
-/** One-call week overview for natural-language summaries: sleep + readiness + activity + stress. */
+/** One-call overview for natural-language summaries: sleep + readiness + activity + stress + spo2. */
 export async function getRecentSummary(days = 7, token?: string): Promise<Record<string, unknown>> {
   if (!Number.isInteger(days) || days <= 0 || days > 90) {
     throw new OuraError(`Invalid days "${days}" — integer 1..90.`);
@@ -422,11 +488,12 @@ export async function getRecentSummary(days = 7, token?: string): Promise<Record
   const start = new Date(Date.now() - (days - 1) * 86_400_000);
   const fmt = (d: Date) => d.toISOString().slice(0, 10);
   const range = { start_date: fmt(start), end_date: fmt(end) };
-  const [sleep, readiness, activity, stress] = await Promise.all([
+  const [sleep, readiness, activity, stress, spo2] = await Promise.all([
     fetchAllPages(`/v2/usercollection/daily_sleep`, range, undefined, token),
     fetchAllPages(`/v2/usercollection/daily_readiness`, range, undefined, token),
     fetchAllPages(`/v2/usercollection/daily_activity`, range, undefined, token),
     fetchAllPages(`/v2/usercollection/daily_stress`, range, undefined, token).catch(() => [] as unknown[]),
+    fetchAllPages(`/v2/usercollection/daily_spo2`, range, undefined, token).catch(() => [] as unknown[]),
   ]);
   return {
     range,
@@ -435,11 +502,13 @@ export async function getRecentSummary(days = 7, token?: string): Promise<Record
       daily_readiness: readiness.length,
       daily_activity: activity.length,
       daily_stress: stress.length,
+      daily_spo2: spo2.length,
     },
     daily_sleep: sleep,
     daily_readiness: readiness,
     daily_activity: activity,
     daily_stress: stress,
+    daily_spo2: spo2,
     note: "Arrays are day-keyed; join on `day`. Scores are 0-100 where present. Ask follow-ups with get_daily/get_collection for detail.",
   };
 }

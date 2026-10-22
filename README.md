@@ -188,9 +188,24 @@ values), or `OURARING_REFRESH_TOKEN` + client credentials in the gateway environ
 ```json
 { "data_type": "sleep", "start_date": "2026-10-15", "end_date": "2026-10-22" }
 { "collection": "heartrate", "start_datetime": "2026-10-22T00:00:00Z", "latest": true }
-{ "collection": "workout", "start_date": "2026-10-01", "end_date": "2026-10-22" }
+{ "collection": "ring_battery_level", "start_datetime": "2026-10-21T00:00:00-04:00" }
+{ "collection": "workout", "start_date": "2026-10-01", "end_date": "2026-10-22", "fields": "activity_type,calories" }
+{ "collection": "VO2_Max", "start_date": "2026-09-22", "end_date": "2026-10-22" }
 { "days": 7 }
 ```
+
+Notes (checked against Oura's OpenAPI spec):
+
+- Collection names are case-insensitive, but the API path for VO₂max is
+  case-sensitive upstream (`vO2_max`) — the server maps it automatically.
+- `heartrate` and `ring_battery_level` query by ISO datetime + `latest`;
+  `ring_configuration` takes no date params; everything else takes
+  `start_date`/`end_date`. Single-doc fetch via `document_id` only where the
+  API offers it (not for `enhanced_tag`/`heartrate`/`personal_info`/`ring_battery_level`).
+- `fields` selects response fields on most routes (not `daily_resilience`,
+  `enhanced_tag`, `tag`).
+- Webhooks (`/v2/webhook/*`) are out of scope: they need a public HTTPS URL
+  and write operations — this server is read-only by design.
 
 ## Privacy
 

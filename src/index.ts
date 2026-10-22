@@ -19,7 +19,7 @@ import {
   DETAIL_COLLECTIONS,
 } from "./service.js";
 
-const server = new McpServer({ name: "ouraring-mcp", version: "0.2.0" });
+const server = new McpServer({ name: "ouraring-mcp", version: "0.3.0" });
 
 type Ok = { content: [{ type: "text"; text: string }] };
 type Err = { content: [{ type: "text"; text: string }]; isError: true };
@@ -51,6 +51,10 @@ const limitParam = z
   .max(10000)
   .optional()
   .describe("Max items (default 50).");
+const fieldsParam = z
+  .string()
+  .optional()
+  .describe("Comma-separated field selector (most routes; not daily_resilience/enhanced_tag/tag).");
 
 server.registerTool(
   "oura_status",
@@ -92,11 +96,12 @@ server.registerTool(
       start_date: dateParam,
       end_date: dateParam,
       limit: limitParam,
+      fields: fieldsParam,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ data_type, start_date, end_date, limit }) =>
-    safe(() => getDaily(data_type, { start_date, end_date, limit })),
+  async ({ data_type, start_date, end_date, limit, fields }) =>
+    safe(() => getDaily(data_type, { start_date, end_date, limit, fields })),
 );
 
 server.registerTool(
@@ -112,15 +117,16 @@ server.registerTool(
         ),
       start_date: dateParam,
       end_date: dateParam,
-      start_datetime: z.string().optional().describe("Heartrate only: ISO datetime, e.g. 2026-10-15T00:00:00Z."),
-      end_datetime: z.string().optional().describe("Heartrate only: ISO datetime."),
-      latest: z.boolean().optional().describe("Heartrate only: return the most recent sample."),
-      document_id: z.string().optional().describe("Fetch one document by id."),
+      start_datetime: z.string().optional().describe("Heartrate and ring_battery_level: ISO datetime, e.g. 2026-10-15T00:00:00Z."),
+      end_datetime: z.string().optional().describe("Heartrate and ring_battery_level: ISO datetime."),
+      latest: z.boolean().optional().describe("Heartrate and ring_battery_level: return the most recent sample."),
+      document_id: z.string().optional().describe("Fetch one document by id (not for enhanced_tag/heartrate/personal_info/ring_battery_level)."),
       limit: limitParam,
+      fields: fieldsParam,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ collection, start_date, end_date, start_datetime, end_datetime, latest, document_id, limit }) =>
+  async ({ collection, start_date, end_date, start_datetime, end_datetime, latest, document_id, limit, fields }) =>
     safe(() =>
       getCollection(collection, {
         start_date,
@@ -130,6 +136,7 @@ server.registerTool(
         latest,
         document_id,
         limit,
+        fields,
       }),
     ),
 );
@@ -138,7 +145,7 @@ server.registerTool(
   "get_recent_summary",
   {
     description:
-      "One-call overview of the last N days (sleep + readiness + activity + stress daily summaries) for natural-language summaries like 'how was my week?'.",
+      "One-call overview of the last N days (sleep + readiness + activity + stress + spo2 daily summaries) for natural-language summaries like 'how was my week?'.",
     inputSchema: {
       days: z.number().int().min(1).max(90).optional().describe("Recent calendar days (default 7, max 90)."),
     },
