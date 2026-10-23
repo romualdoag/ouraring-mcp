@@ -210,7 +210,27 @@ Notes (checked against Oura's OpenAPI spec):
 ## Privacy
 
 See [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md): on-demand reads only,
-no storage, no sharing, single user. Revoke any time from your Oura dashboard.
+no sharing, single user. Revoke any time from your Oura dashboard.
+
+## Cold cache
+
+Repeat date-range queries don't re-hit Oura: responses are cached in
+`./oura-cache.sqlite` (node:sqlite, git-ignored — never committed) with
+per-day coverage. The last 2 days always refetch (Oura keeps finalizing
+them); older days are immutable — fetched once, served forever. Range queries
+that end in the past and are fully covered use zero upstream calls
+(`cacheHit: true` in the response). `personal_info` / `ring_configuration`
+are cached 30 days, single-document fetches 7 days. Any SQLite error
+disables the cache silently and the call goes straight to the API.
+
+```bash
+OURARING_CACHE_PATH=/tmp/oura.sqlite   # default ./oura-cache.sqlite
+OURARING_CACHE_ENABLED=0               # bypass cache, fail-soft
+OURARING_PERSONAL_INFO_TTL_HOURS=720   # default 30d
+OURARING_RING_CONFIGURATION_TTL_HOURS=720
+OURARING_CACHE_TTL_HOURS=168           # default 7d for the rest
+```
+(`OURA_*` aliases work for every knob above.)
 
 ## Develop
 

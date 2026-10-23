@@ -9,7 +9,11 @@ const entry = join(root, "dist", "index.js");
 function rpc(objects: unknown[], expectedResponses: number): Promise<{ lines: unknown[] }> {
   return new Promise((resolve, reject) => {
     const child = spawn("node", [entry], {
-      env: { ...process.env, OURARING_ACCESS_TOKEN: "test-token" },
+      env: {
+        ...process.env,
+        OURARING_ACCESS_TOKEN: "test-token",
+        OURARING_CACHE_PATH: ":memory:", // hermetic: never write ./oura-cache.sqlite
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let buf = "";

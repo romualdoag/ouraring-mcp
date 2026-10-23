@@ -11,6 +11,7 @@ import {
   resetFetch,
   OuraError,
 } from "../src/service.js";
+import { __resetForTests, close } from "../src/cache.js";
 
 function fakeFetch(routes: Record<string, unknown>) {
   return (async (url: unknown) => {
@@ -26,11 +27,13 @@ function fakeFetch(routes: Record<string, unknown>) {
 
 describe("offline unit", () => {
   beforeEach(() => {
+    __resetForTests(":memory:"); // hermetic: never touch ./oura-cache.sqlite
     process.env.OURARING_ACCESS_TOKEN = "test-token";
     delete process.env.OURA_ACCESS_TOKEN;
   });
   afterEach(() => {
     resetFetch();
+    close();
     delete process.env.OURARING_ACCESS_TOKEN;
   });
 

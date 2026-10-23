@@ -28,8 +28,11 @@ access anyone else's data — there is exactly one user: the token holder.
 
 - **Fetched on demand.** When you ask a question, the server calls the Oura
   API live over HTTPS and returns the result to your assistant.
-- **Not stored.** The server keeps no database, no logs of health data, no
-  backups. Responses live only in the assistant conversation you chose to use.
+- **Cached locally, on your machine only.** Repeat queries reuse a local
+  SQLite file (`./oura-cache.sqlite`, never committed, never uploaded) so
+  the server doesn't re-hit Oura every time. No logs of health data, no
+  backups. Delete the file any time to wipe the cache; set
+  `OURARING_CACHE_ENABLED=0` to disable it entirely.
 - **Not shared.** Data is never sold, never sent to advertisers or third
   parties, never used for tracking. The only network calls are to
   `api.ouraring.com` (Oura) at your request.
@@ -41,8 +44,8 @@ access anyone else's data — there is exactly one user: the token holder.
 
 ## Retention and deletion
 
-Because nothing is stored, there is nothing to retain. Delete the local
-checkout/`.env` and revoke the token and every copy is gone. To ask
+Only the local cache file above is retained, on your machine. Delete the local
+checkout/`.env`/cache file and revoke the token and every copy is gone. To ask
 questions about this policy, email romualdoag@gmail.com.
 
 ## Security
