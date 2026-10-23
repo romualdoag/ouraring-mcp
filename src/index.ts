@@ -3,8 +3,8 @@
  * ouraring-mcp — read your own Oura Ring data through MCP.
  *
  * Personal, single-user, non-commercial. Data is fetched on demand
- * from api.ouraring.com and never stored by this server.
- */
+ * from api.ouraring.com into a local cold cache (node:sqlite,
+ * ./oura-cache.sqlite, git-ignored) — repeat queries reuse coverage. */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";

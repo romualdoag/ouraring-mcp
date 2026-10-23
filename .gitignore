@@ -4,3 +4,6 @@ dist/
 .tokens.json
 *.log
 .DS_Store
+# Cold cache (node:sqlite) — third-party upstream data, never committed.
+*.sqlite
+*.sqlite-*

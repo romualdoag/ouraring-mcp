@@ -8,6 +8,24 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  OURA_RECENT_REFRESH_DAYS,
+  addDaysStr,
+  chunkRange,
+  collectionCacheKey,
+  collectionTtlHours,
+  defaultCacheTtlHours,
+  eachDate,
+  getUnfetchedDates,
+  groupConsecutiveDates,
+  itemDay,
+  kvGet,
+  kvSet,
+  loadDayItems,
+  personalInfoTtlHours,
+  saveDayItems,
+  todayUtc,
+} from "./cache.js";
 
 export const OURA_API_BASE =
   (process.env.OURA_API_BASE || process.env.OURARING_API_BASE)?.replace(/\/$/, "") ||
@@ -347,9 +365,13 @@ export async function ouraStatus(): Promise<Record<string, unknown>> {
 }
 
 export async function getPersonalInfo(token?: string): Promise<unknown> {
+  const cached = kvGet("personal_info", personalInfoTtlHours());
+  if (cached !== undefined) return cached;
   const page = await ouraGet("/v2/usercollection/personal_info", {}, token);
   // personal_info returns a single object, not a paged list, on some accounts
-  return (page as unknown as { data?: unknown }).data ?? page;
+  const result = (page as unknown as { data?: unknown }).data ?? page;
+  kvSet("personal_info", result);
+  return result;
 }
 
 export interface DateRangeOpts {
@@ -398,6 +420,107 @@ async function fetchAllPages<T>(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// cold-cache wiring (fetched-days incremental + KV, fail-soft)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ranges ending at/near today refetch the last OURA_RECENT_REFRESH_DAYS days
+ * (Oura keeps finalizing them). Ranges ending further in the past are fully
+ * servable from cache when covered (refresh 0).
+ */
+function refreshForRangeEnd(endDate: string): number {
+  const liveCutoff = addDaysStr(todayUtc(), -OURA_RECENT_REFRESH_DAYS);
+  return endDate > liveCutoff ? OURA_RECENT_REFRESH_DAYS : 0;
+}
+
+/** Bucket rows by their Oura day; rows without a parseable day skip the cache. */
+function bucketRowsByDay(rows: unknown[]): { date: string; item: unknown }[] {
+  const dated: { date: string; item: unknown }[] = [];
+  for (const r of rows) {
+    const d = itemDay(r);
+    if (d) dated.push({ date: d, item: r });
+  }
+  return dated;
+}
+
+/** Opportunistic save for unbounded fetches: cache the days that came back. */
+function saveFetchedRows(collectionKey: string, rows: unknown[]): void {
+  const dated = bucketRowsByDay(rows);
+  if (dated.length === 0) return;
+  saveDayItems(
+    collectionKey,
+    dated,
+    [...new Set(dated.map((d) => d.date))].sort(),
+  );
+}
+
+/** Fetch one date gap in chunks, saving coverage as it goes. */
+async function fetchGapByDate<T>(
+  path: string,
+  collectionKey: string,
+  gap: { from: string; to: string },
+  fields: string | undefined,
+  token?: string,
+): Promise<void> {
+  for (const chunk of chunkRange(gap.from, gap.to)) {
+    const rows = await fetchAllPages<T>(
+      path,
+      {
+        start_date: chunk.from,
+        end_date: chunk.to,
+        next_token: undefined,
+        fields,
+      },
+      undefined,
+      token,
+    );
+    saveDayItems(collectionKey, bucketRowsByDay(rows), eachDate(chunk.from, chunk.to));
+  }
+}
+
+/** Fetch one datetime gap in chunks, saving coverage as it goes. */
+async function fetchGapByDatetime<T>(
+  path: string,
+  collectionKey: string,
+  gap: { from: string; to: string },
+  range: { startDate: string; endDate: string; startDatetime?: string; endDatetime?: string },
+  fields: string | undefined,
+  token?: string,
+): Promise<void> {
+  for (const chunk of chunkRange(gap.from, gap.to)) {
+    const rows = await fetchAllPages<T>(
+      path,
+      {
+        start_datetime:
+          chunk.from === range.startDate ? range.startDatetime : `${chunk.from}T00:00:00`,
+        end_datetime:
+          chunk.to === range.endDate ? range.endDatetime : `${chunk.to}T23:59:59`,
+        next_token: undefined,
+        fields,
+      },
+      undefined,
+      token,
+    );
+    saveDayItems(collectionKey, bucketRowsByDay(rows), eachDate(chunk.from, chunk.to));
+  }
+}
+
+/** Rebuild a cached range response (shared by getDaily/getCollection). */
+function cachedRangeResponse(
+  collection: string,
+  range: Record<string, string | null>,
+  collectionKey: string,
+  from: string,
+  to: string,
+  limit: number | undefined,
+  cacheHit: boolean,
+): Record<string, unknown> {
+  const items = loadDayItems(collectionKey, from, to).map((d) => d.item);
+  const { items: sliced, truncated, total } = withLimit(items, limit ?? 50);
+  return { collection, effective_range: range, total, truncated, items: sliced, cacheHit };
+}
+
 export async function getDaily(
   dataType: string,
   opts: DateRangeOpts = {},
@@ -409,19 +532,45 @@ export async function getDaily(
   }
   assertDateRange(opts);
   assertFields(`daily_${t}`, opts.fields);
-  const rows = await fetchAllPages(`/v2/usercollection/daily_${t}`, {
+  const collection = `daily_${t}`;
+  const apiPath = `/v2/usercollection/daily_${t}`;
+  const range = { start_date: opts.start_date ?? null, end_date: opts.end_date ?? null };
+  // Explicit paging walks the upstream directly (no coverage bookkeeping).
+  if (opts.next_token) {
+    const rows = await fetchAllPages(apiPath, {
+      start_date: opts.start_date,
+      end_date: opts.end_date,
+      next_token: opts.next_token,
+      fields: opts.fields,
+    }, opts.limit, token);
+    const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
+    return { collection, effective_range: range, total, truncated, items, cacheHit: false };
+  }
+  const key = collectionCacheKey(collection, opts.fields);
+  if (opts.start_date && opts.end_date) {
+    const { start_date, end_date } = opts;
+    const missing = getUnfetchedDates(key, start_date, end_date, refreshForRangeEnd(end_date));
+    for (const gap of groupConsecutiveDates(missing)) {
+      await fetchGapByDate(apiPath, key, gap, opts.fields, token);
+    }
+    return cachedRangeResponse(collection, range, key, start_date, end_date, opts.limit, missing.length === 0);
+  }
+  // Unbounded: live by nature — fetch direct, warm the cache opportunistically.
+  const rows = await fetchAllPages(apiPath, {
     start_date: opts.start_date,
     end_date: opts.end_date,
-    next_token: opts.next_token,
+    next_token: undefined,
     fields: opts.fields,
   }, opts.limit, token);
+  saveFetchedRows(key, rows);
   const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
   return {
-    collection: `daily_${t}`,
-    effective_range: { start_date: opts.start_date ?? null, end_date: opts.end_date ?? null },
+    collection,
+    effective_range: range,
     total,
     truncated,
     items,
+    cacheHit: false,
   };
 }
 
@@ -444,7 +593,11 @@ export async function getCollection(
       `Unknown collection "${collection}". See list_collections — e.g. sleep, workout, session, tag, heartrate, daily_sleep.`,
     );
   }
-  if (c === "personal_info") return { collection: c, result: await getPersonalInfo(token) };
+  if (c === "personal_info") {
+    const peek = kvGet("personal_info", personalInfoTtlHours());
+    if (peek !== undefined) return { collection: c, result: peek, cacheHit: true };
+    return { collection: c, result: await getPersonalInfo(token), cacheHit: false };
+  }
   assertDateRange(opts);
   assertFields(c, opts.fields);
   if (opts.limit !== undefined && (!Number.isInteger(opts.limit) || opts.limit <= 0)) {
@@ -455,28 +608,114 @@ export async function getCollection(
     if (!DOC_VARIANTS.has(c)) {
       throw new OuraError(`Collection "${collection}" has no single-document endpoint — query it by date range instead.`);
     }
+    const docKey = `${collectionCacheKey(c, opts.fields)}|doc=${opts.document_id}`;
+    const cachedDoc = kvGet(docKey, defaultCacheTtlHours());
+    if (cachedDoc !== undefined) {
+      return { collection: c, document_id: opts.document_id, result: cachedDoc, cacheHit: true };
+    }
     const page = await ouraGet(`${collectionPath(c)}/${opts.document_id}`, {}, token);
-    return { collection: c, document_id: opts.document_id, result: (page as unknown as { data?: unknown }).data ?? page };
+    const result = (page as unknown as { data?: unknown }).data ?? page;
+    kvSet(docKey, result);
+    return { collection: c, document_id: opts.document_id, result, cacheHit: false };
   }
-  const params: Record<string, string | undefined> = DATETIME_COLLECTIONS.has(c)
-    ? {
-      start_datetime: opts.start_datetime,
-      end_datetime: opts.end_datetime,
-      latest: opts.latest ? "true" : undefined,
+  // NODATE collections (ring_configuration): whole-list KV, 30d by default.
+  if (NODATE_COLLECTIONS.has(c)) {
+    const key = collectionCacheKey(c, opts.fields);
+    if (!opts.next_token) {
+      const cachedRows = kvGet(key, collectionTtlHours(c));
+      if (Array.isArray(cachedRows)) {
+        const { items, truncated, total } = withLimit(cachedRows, opts.limit ?? 50);
+        return { collection: c, total, truncated, items, cacheHit: true };
+      }
+    }
+    const rows = await fetchAllPages(collectionPath(c), {
       next_token: opts.next_token,
       fields: opts.fields,
-    }
-    : NODATE_COLLECTIONS.has(c)
-      ? { next_token: opts.next_token, fields: opts.fields }
+    }, opts.limit, token);
+    if (!opts.next_token) kvSet(key, rows);
+    const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
+    return { collection: c, total, truncated, items, cacheHit: false };
+  }
+  const key = collectionCacheKey(c, opts.fields);
+  // Explicit paging / latest: walk the upstream directly, warm cache on the way.
+  if (opts.next_token || opts.latest) {
+    const params: Record<string, string | undefined> = DATETIME_COLLECTIONS.has(c)
+      ? {
+        start_datetime: opts.start_datetime,
+        end_datetime: opts.end_datetime,
+        latest: opts.latest ? "true" : undefined,
+        next_token: opts.next_token,
+        fields: opts.fields,
+      }
       : {
         start_date: opts.start_date,
         end_date: opts.end_date,
         next_token: opts.next_token,
         fields: opts.fields,
       };
+    const rows = await fetchAllPages(collectionPath(c), params, opts.limit, token);
+    saveFetchedRows(key, rows);
+    const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
+    return { collection: c, total, truncated, items, cacheHit: false };
+  }
+  if (DATETIME_COLLECTIONS.has(c)) {
+    const startDate = opts.start_datetime?.slice(0, 10);
+    const endDate = opts.end_datetime?.slice(0, 10);
+    if (
+      startDate && endDate && isValidDate(startDate) && isValidDate(endDate) &&
+      opts.start_datetime && opts.end_datetime
+    ) {
+      const missing = getUnfetchedDates(key, startDate, endDate, refreshForRangeEnd(endDate));
+      for (const gap of groupConsecutiveDates(missing)) {
+        await fetchGapByDatetime(
+          collectionPath(c),
+          key,
+          gap,
+          { startDate, endDate, startDatetime: opts.start_datetime, endDatetime: opts.end_datetime },
+          opts.fields,
+          token,
+        );
+      }
+      const res = cachedRangeResponse(c, {}, key, startDate, endDate, opts.limit, missing.length === 0);
+      return { ...res, effective_range: { start_datetime: opts.start_datetime, end_datetime: opts.end_datetime } };
+    }
+    const rows = await fetchAllPages(collectionPath(c), {
+      start_datetime: opts.start_datetime,
+      end_datetime: opts.end_datetime,
+      latest: undefined,
+      next_token: undefined,
+      fields: opts.fields,
+    }, opts.limit, token);
+    saveFetchedRows(key, rows);
+    const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
+    return { collection: c, total, truncated, items, cacheHit: false };
+  }
+  if (opts.start_date && opts.end_date) {
+    const { start_date, end_date } = opts;
+    const missing = getUnfetchedDates(key, start_date, end_date, refreshForRangeEnd(end_date));
+    for (const gap of groupConsecutiveDates(missing)) {
+      await fetchGapByDate(collectionPath(c), key, gap, opts.fields, token);
+    }
+    return cachedRangeResponse(
+      c,
+      { start_date, end_date },
+      key,
+      start_date,
+      end_date,
+      opts.limit,
+      missing.length === 0,
+    );
+  }
+  const params: Record<string, string | undefined> = {
+    start_date: opts.start_date,
+    end_date: opts.end_date,
+    next_token: undefined,
+    fields: opts.fields,
+  };
   const rows = await fetchAllPages(collectionPath(c), params, opts.limit, token);
+  saveFetchedRows(key, rows);
   const { items, truncated, total } = withLimit(rows, opts.limit ?? 50);
-  return { collection: c, total, truncated, items };
+  return { collection: c, total, truncated, items, cacheHit: false };
 }
 
 /** One-call overview for natural-language summaries: sleep + readiness + activity + stress + spo2. */
