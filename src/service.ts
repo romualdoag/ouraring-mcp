@@ -11,10 +11,12 @@ import { fileURLToPath } from "node:url";
 import {
   OURA_RECENT_REFRESH_DAYS,
   addDaysStr,
+  canonicalCollectionName,
   chunkRange,
   collectionCacheKey,
   collectionTtlHours,
   defaultCacheTtlHours,
+  documentCacheKey,
   eachDate,
   getUnfetchedDates,
   groupConsecutiveDates,
@@ -286,7 +288,7 @@ const COLLECTION_PATH: Record<string, string> = {
 
 /** Exact /v2/usercollection/<path> for a (case-insensitive) collection name. */
 export function collectionPath(collection: string): string {
-  const seg = COLLECTION_PATH[collection.toLowerCase()];
+  const seg = COLLECTION_PATH[canonicalCollectionName(collection)];
   if (!seg) throw new OuraError(`Unknown collection "${collection}". See list_collections.`);
   return `/v2/usercollection/${seg}`;
 }
@@ -365,12 +367,13 @@ export async function ouraStatus(): Promise<Record<string, unknown>> {
 }
 
 export async function getPersonalInfo(token?: string): Promise<unknown> {
-  const cached = kvGet("personal_info", personalInfoTtlHours());
+  const key = collectionCacheKey("personal_info");
+  const cached = kvGet(key, personalInfoTtlHours());
   if (cached !== undefined) return cached;
   const page = await ouraGet("/v2/usercollection/personal_info", {}, token);
   // personal_info returns a single object, not a paged list, on some accounts
   const result = (page as unknown as { data?: unknown }).data ?? page;
-  kvSet("personal_info", result);
+  kvSet(key, result);
   return result;
 }
 
@@ -526,7 +529,7 @@ export async function getDaily(
   opts: DateRangeOpts = {},
   token?: string,
 ): Promise<Record<string, unknown>> {
-  const t = dataType.toLowerCase() as DailyType;
+  const t = canonicalCollectionName(dataType) as DailyType;
   if (!(DAILY_TYPES as readonly string[]).includes(t)) {
     throw new OuraError(`Unknown daily type "${dataType}" — one of: ${DAILY_TYPES.join(", ")}.`);
   }
@@ -586,7 +589,7 @@ export async function getCollection(
   opts: CollectionOpts = {},
   token?: string,
 ): Promise<Record<string, unknown>> {
-  const c = collection.toLowerCase();
+  const c = canonicalCollectionName(collection);
   const known = new Set<string>([...DETAIL_COLLECTIONS, ...DAILY_TYPES.map((t) => `daily_${t}`), "personal_info"]);
   if (!known.has(c)) {
     throw new OuraError(
@@ -594,7 +597,8 @@ export async function getCollection(
     );
   }
   if (c === "personal_info") {
-    const peek = kvGet("personal_info", personalInfoTtlHours());
+    const key = collectionCacheKey("personal_info");
+    const peek = kvGet(key, personalInfoTtlHours());
     if (peek !== undefined) return { collection: c, result: peek, cacheHit: true };
     return { collection: c, result: await getPersonalInfo(token), cacheHit: false };
   }
@@ -608,7 +612,7 @@ export async function getCollection(
     if (!DOC_VARIANTS.has(c)) {
       throw new OuraError(`Collection "${collection}" has no single-document endpoint — query it by date range instead.`);
     }
-    const docKey = `${collectionCacheKey(c, opts.fields)}|doc=${opts.document_id}`;
+    const docKey = documentCacheKey(c, opts.fields, opts.document_id);
     const cachedDoc = kvGet(docKey, defaultCacheTtlHours());
     if (cachedDoc !== undefined) {
       return { collection: c, document_id: opts.document_id, result: cachedDoc, cacheHit: true };
