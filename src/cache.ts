@@ -26,6 +26,11 @@ import path from "node:path";
 /** Recent days always refetch (today + yesterday): Oura keeps appending. */
 export const OURA_RECENT_REFRESH_DAYS = 2;
 
+/** Version prefix baked into every cache key (KV + day tables).
+ *  Bumping it retires a whole keyspace at once; readers fall back to the
+ *  unprefixed legacy key on miss (lazy migration, fail-soft). */
+export const CACHE_KEY_VERSION = "v1";
+
 /** Chunk size for gap fetches (bound single-response size). */
 export const OURA_MAX_RANGE_DAYS = 90;
 
@@ -83,7 +88,7 @@ export function defaultCacheTtlHours(): number {
 
 /** TTL for a KV entry of a given collection. */
 export function collectionTtlHours(collection: string): number {
-  const c = collection.toLowerCase();
+  const c = canonicalCollectionName(collection);
   if (c === "personal_info") return personalInfoTtlHours();
   if (c === "ring_configuration") return ringConfigurationTtlHours();
   return defaultCacheTtlHours();
@@ -195,11 +200,16 @@ export function getUnfetchedDates(
   if (!store) return dates;
   try {
     const cutoff = addDaysStr(to, -refreshRecentDays);
+    // Union with the legacy (pre-v1) keyspace: rows written before the
+    // version prefix still count as coverage; new writes go to the new key.
+    const legacy = legacyKeyFor(collectionKey);
+    const keys = legacy && legacy !== collectionKey ? [collectionKey, legacy] : [collectionKey];
+    const placeholders = keys.map(() => "?").join(",");
     const rows = store
       .prepare(
-        "SELECT date FROM oura_fetched WHERE collection_key = ? AND date >= ? AND date <= ?",
+        `SELECT date FROM oura_fetched WHERE collection_key IN (${placeholders}) AND date >= ? AND date <= ?`,
       )
-      .all(collectionKey, from, to) as { date: string }[];
+      .all(...keys, from, to) as { date: string }[];
     const covered = new Set(rows.map((r) => r.date));
     return dates.filter((d) => d > cutoff || !covered.has(d));
   } catch {
@@ -267,8 +277,59 @@ export function itemDay(item: unknown): string | undefined {
 
 /** Cache key for a collection query (collection + field selector). */
 export function collectionCacheKey(collection: string, fields?: string): string {
-  const c = collection.toLowerCase();
-  return fields ? `${c}|fields=${fields}` : c;
+  const c = canonicalCollectionName(collection);
+  const f = normalizeFields(fields);
+  return f ? `${CACHE_KEY_VERSION}:${c}|fields=${f}` : `${CACHE_KEY_VERSION}:${c}`;
+}
+
+/**
+ * Historic renames / out-of-band spellings: old key → canonical collection.
+ * A rename must never orphan cached rows — add the old name here and both
+ * spellings resolve to the same keyspace. (No renames shipped yet; `vo2max`
+ * covers the bare spelling users type for the case-sensitive `vO2_max` route.)
+ */
+const COLLECTION_ALIASES: Record<string, string> = {
+  vo2max: "vo2_max",
+};
+
+/** Canonical collection name: trim + lowercase, `-`/space → `_`, alias map. */
+export function canonicalCollectionName(collection: string): string {
+  const normalized = collection
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_")
+    .replace(/_+/g, "_");
+  return COLLECTION_ALIASES[normalized] ?? normalized;
+}
+
+/** Canonical field selector: split on comma, trim, lowercase, dedupe, sort. */
+export function normalizeFields(fields?: string): string | undefined {
+  if (fields === undefined) return undefined;
+  const parts = [...new Set(fields.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean))].sort();
+  return parts.length > 0 ? parts.join(",") : undefined;
+}
+
+/** Canonical document id: trim + lowercase. */
+export function normalizeDocumentId(documentId: string): string {
+  return documentId.trim().toLowerCase();
+}
+
+/** Cache key for a single-document fetch (collection + fields + document). */
+export function documentCacheKey(
+  collection: string,
+  fields: string | undefined,
+  documentId: string,
+): string {
+  return `${collectionCacheKey(collection, fields)}|doc=${normalizeDocumentId(documentId)}`;
+}
+
+/**
+ * Legacy (pre-v1) counterpart of a versioned key: strip the `v1:` prefix.
+ * `undefined` when the key was never versioned (nothing to fall back to).
+ */
+export function legacyKeyFor(key: string): string | undefined {
+  const prefix = `${CACHE_KEY_VERSION}:`;
+  return key.startsWith(prefix) ? key.slice(prefix.length) : undefined;
 }
 
 /** Load cached items for a collection key over [from, to], ordered by date. */
@@ -280,17 +341,34 @@ export function loadDayItems(
   const store = getDb();
   if (!store) return [];
   try {
+    const legacy = legacyKeyFor(collectionKey);
+    const keys = legacy && legacy !== collectionKey ? [collectionKey, legacy] : [collectionKey];
+    const placeholders = keys.map(() => "?").join(",");
     const rows = store
       .prepare(
-        `SELECT date, item_json AS itemJson FROM oura_days
-         WHERE collection_key = ? AND date >= ? AND date <= ?
+        `SELECT date, item_json AS itemJson, collection_key AS key FROM oura_days
+         WHERE collection_key IN (${placeholders}) AND date >= ? AND date <= ?
          ORDER BY date, idx`,
       )
-      .all(collectionKey, from, to) as { date: string; itemJson: string }[];
-    return rows.map((r) => ({
-      date: r.date,
-      item: JSON.parse(r.itemJson) as unknown,
-    }));
+      .all(...keys, from, to) as { date: string; itemJson: string; key: string }[];
+    // Dedupe rows present under both keys (pre/post-migration overlap),
+    // preferring the versioned key; same-key duplicates are preserved.
+    const seen = new Map<string, string>();
+    const ordered = [...rows].sort((a, b) =>
+      a.key === collectionKey && b.key !== collectionKey ? -1
+      : b.key === collectionKey && a.key !== collectionKey ? 1
+      : 0,
+    );
+    const out: DayItem[] = [];
+    for (const r of ordered) {
+      const dedupe = `${r.date}::${r.itemJson}`;
+      const firstKey = seen.get(dedupe);
+      if (firstKey !== undefined && firstKey !== r.key) continue;
+      seen.set(dedupe, r.key);
+      out.push({ date: r.date, item: JSON.parse(r.itemJson) as unknown });
+    }
+    out.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    return out;
   } catch {
     return [];
   }
@@ -346,18 +424,37 @@ export function saveDayItems(
 // KV (personal_info, ring_configuration, single docs — near-static data)
 // ---------------------------------------------------------------------------
 
-/** Read from KV when fresh; `undefined` = miss, expired, disabled, or error. */
+/** Read from KV when fresh; `undefined` = miss, expired, disabled, or error.
+ *  On a miss under a versioned key, the legacy (pre-v1) key is tried and,
+ *  when fresh, copied forward — lazy migration, fail-soft. */
 export function kvGet(key: string, ttlHours: number): unknown | undefined {
   const store = getDb();
   if (!store) return undefined;
   try {
-    const row = store
-      .prepare("SELECT value_json AS valueJson, fetched_at AS fetchedAt FROM kv_cache WHERE key = ?")
-      .get(key) as { valueJson: string; fetchedAt: string } | undefined;
-    if (!row) return undefined;
-    const ageMs = Date.now() - Date.parse(row.fetchedAt);
-    if (!Number.isFinite(ageMs) || ageMs > ttlHours * 3_600_000) return undefined;
-    return JSON.parse(row.valueJson) as unknown;
+    const readFresh = (k: string): { found: boolean; value?: unknown } => {
+      const row = store
+        .prepare("SELECT value_json AS valueJson, fetched_at AS fetchedAt FROM kv_cache WHERE key = ?")
+        .get(k) as { valueJson: string; fetchedAt: string } | undefined;
+      if (!row) return { found: false };
+      const ageMs = Date.now() - Date.parse(row.fetchedAt);
+      if (!Number.isFinite(ageMs) || ageMs > ttlHours * 3_600_000) return { found: true };
+      return { found: true, value: JSON.parse(row.valueJson) as unknown };
+    };
+    const hit = readFresh(key);
+    if (hit.value !== undefined) return hit.value;
+    if (hit.found) return undefined; // present but expired — legacy is older still
+    const legacy = legacyKeyFor(key);
+    if (!legacy || legacy === key) return undefined;
+    const old = readFresh(legacy);
+    if (old.value === undefined) return undefined;
+    // Lazy forward-migration (best-effort; never breaks the read path).
+    try {
+      kvSet(key, old.value);
+      store.prepare("DELETE FROM kv_cache WHERE key = ?").run(legacy);
+    } catch {
+      /* fail-soft */
+    }
+    return old.value;
   } catch {
     return undefined;
   }
